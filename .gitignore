@@ -1,0 +1,12 @@
+nano .gitignore
+# Python virtual environment
+venv/
+venv311/
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# OS files
+.DS_Store
