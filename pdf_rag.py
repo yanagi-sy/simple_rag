@@ -51,7 +51,7 @@ from langchain.prompts import PromptTemplate
 from sentence_transformers import CrossEncoder
 
 # 型ヒント（変数の型を明示するための機能）
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 # 正規表現、OS操作、警告制御のための標準ライブラリ
 import re, os, warnings
@@ -634,3 +634,418 @@ iptablesのNATテーブルとフィルターテーブルにおけるパケット
         
         print(f"\n【LLM生成結論】")
         print(result)
+
+# =========================================
+# ④ 複数ソース対応RAGシステム（拡張版）
+# =========================================
+class MultiSourceRagSystem:
+    """
+    複数のソース（PDF/テキストファイル/手動テキスト）を統合管理するRAGシステム
+    
+    既存のPDFRagSystemの設計思想を維持しつつ、
+    複数のソースを1つの知識ベースとして扱えるように拡張したクラス。
+    
+    主な機能：
+    - 複数のPDFファイルを読み込む
+    - テキストファイル（.txt）を読み込む
+    - 手動で入力したテキストを読み込む
+    - すべてのソースを統合して1つの知識ベースとして扱う
+    - 各チャンクにソース情報（source_type, source_name）を付与
+    
+    設計方針：
+    - 既存のPDFRagSystemのロジックを再利用
+    - チャンキング、ベクトル化、検索の流れは同じ
+    - ソース管理機能のみ追加
+    """
+    
+    def __init__(self, persist_dir="./chroma_db"):
+        """
+        初期化メソッド
+        
+        Args:
+            persist_dir: ベクトルデータベースを保存するフォルダのパス
+        """
+        # Chroma DBの保存フォルダ
+        self.persist_dir = persist_dir
+        
+        # ベクトルストア（後で初期化される）
+        self.vectorstore = None
+        
+        # すべてのソースから読み込んだチャンクを統合したリスト
+        self.docs: List[Document] = []
+        
+        # 読み込んだソースの情報を管理するリスト
+        # 各要素は {"type": "pdf/text_file/manual_text", "name": "ファイル名 or 識別名"}
+        self.sources: List[dict] = []
+        
+        # Semantic検索用のembeddingモデル（既存と同じ384次元）
+        self.embeddings = HuggingFaceEmbeddings(
+            model_name="sentence-transformers/all-MiniLM-L6-v2"
+        )
+        
+        # Keyword検索用のBM25（後で初期化される）
+        self.bm25 = None
+    
+    def clean_text(self, text: str) -> str:
+        """
+        テキストのノイズを除去する関数（既存のPDFRagSystemと同じ）
+        
+        Args:
+            text: クリーニング前のテキスト
+            
+        Returns:
+            クリーニング後のテキスト
+        """
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        return text.strip()
+    
+    def add_pdf(self, pdf_path: str, source_name: Optional[str] = None):
+        """
+        PDFファイルを追加するメソッド
+        
+        既存のPDFRagSystemのimport_pdfメソッドのロジックを再利用し、
+        ソース情報をmetadataに付与します。
+        
+        Args:
+            pdf_path: PDFファイルのパス
+            source_name: ソース名（Noneの場合はファイル名を使用）
+        """
+        # ソース名が指定されていない場合は、ファイル名を使用
+        if source_name is None:
+            source_name = os.path.basename(pdf_path)
+        
+        # PDFを読み込む（既存のPDFRagSystemと同じ処理）
+        raw_docs = PyPDFLoader(pdf_path).load()
+        
+        # チャンキング戦略の設定（既存と同じ）
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=420,
+            chunk_overlap=80,
+            separators=["\n\n", "\n", "。", ".", " ", ""]
+        )
+        
+        # PDFをチャンクに分割
+        chunks = splitter.split_documents(raw_docs)
+        
+        # チャンクをクリーニングして、ソース情報を付与
+        for idx, c in enumerate(chunks):
+            text = self.clean_text(c.page_content)
+            
+            if text and len(text) > 120:
+                # metadataにチャンク識別子を追加
+                chunk_id = f"chunk_{c.metadata.get('page', 0)}_{idx}"
+                metadata = c.metadata.copy()
+                metadata['chunk_id'] = chunk_id
+                
+                # ソース情報をmetadataに追加（重要：どのソースから来たか分かるようにする）
+                metadata['source_type'] = 'pdf'
+                metadata['source_name'] = source_name
+                
+                cleaned_doc = Document(page_content=text, metadata=metadata)
+                self.docs.append(cleaned_doc)
+        
+        # ソース情報を記録
+        self.sources.append({
+            "type": "pdf",
+            "name": source_name,
+            "path": pdf_path
+        })
+    
+    def add_text_file(self, text_path: str, source_name: Optional[str] = None):
+        """
+        テキストファイルを追加するメソッド
+        
+        .txtファイルを読み込んで、チャンクに分割して追加します。
+        
+        Args:
+            text_path: テキストファイルのパス
+            source_name: ソース名（Noneの場合はファイル名を使用）
+        """
+        # ソース名が指定されていない場合は、ファイル名を使用
+        if source_name is None:
+            source_name = os.path.basename(text_path)
+        
+        # テキストファイルを読み込む
+        try:
+            with open(text_path, 'r', encoding='utf-8') as f:
+                text_content = f.read()
+        except UnicodeDecodeError:
+            # UTF-8で読めない場合は、他のエンコーディングを試す
+            with open(text_path, 'r', encoding='shift_jis') as f:
+                text_content = f.read()
+        
+        # テキストをDocument形式に変換（ページ情報はなし）
+        raw_doc = Document(
+            page_content=text_content,
+            metadata={"page": 0}
+        )
+        
+        # チャンキング戦略の設定（既存と同じ）
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=420,
+            chunk_overlap=80,
+            separators=["\n\n", "\n", "。", ".", " ", ""]
+        )
+        
+        # テキストをチャンクに分割
+        chunks = splitter.split_documents([raw_doc])
+        
+        # チャンクをクリーニングして、ソース情報を付与
+        for idx, c in enumerate(chunks):
+            text = self.clean_text(c.page_content)
+            
+            if text and len(text) > 120:
+                # metadataにチャンク識別子を追加
+                chunk_id = f"chunk_0_{idx}"
+                metadata = c.metadata.copy()
+                metadata['chunk_id'] = chunk_id
+                
+                # ソース情報をmetadataに追加
+                metadata['source_type'] = 'text_file'
+                metadata['source_name'] = source_name
+                
+                cleaned_doc = Document(page_content=text, metadata=metadata)
+                self.docs.append(cleaned_doc)
+        
+        # ソース情報を記録
+        self.sources.append({
+            "type": "text_file",
+            "name": source_name,
+            "path": text_path
+        })
+    
+    def add_manual_text(self, text_content: str, source_name: str):
+        """
+        手動で入力したテキストを追加するメソッド
+        
+        UI上で直接入力したテキストを読み込んで、チャンクに分割して追加します。
+        
+        Args:
+            text_content: テキストの内容
+            source_name: ソース名（ユーザーが指定した識別名）
+        """
+        # テキストをDocument形式に変換
+        raw_doc = Document(
+            page_content=text_content,
+            metadata={"page": 0}
+        )
+        
+        # チャンキング戦略の設定（既存と同じ）
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=420,
+            chunk_overlap=80,
+            separators=["\n\n", "\n", "。", ".", " ", ""]
+        )
+        
+        # テキストをチャンクに分割
+        chunks = splitter.split_documents([raw_doc])
+        
+        # チャンクをクリーニングして、ソース情報を付与
+        for idx, c in enumerate(chunks):
+            text = self.clean_text(c.page_content)
+            
+            if text and len(text) > 120:
+                # metadataにチャンク識別子を追加
+                chunk_id = f"chunk_0_{idx}"
+                metadata = c.metadata.copy()
+                metadata['chunk_id'] = chunk_id
+                
+                # ソース情報をmetadataに追加
+                metadata['source_type'] = 'manual_text'
+                metadata['source_name'] = source_name
+                
+                cleaned_doc = Document(page_content=text, metadata=metadata)
+                self.docs.append(cleaned_doc)
+        
+        # ソース情報を記録
+        self.sources.append({
+            "type": "manual_text",
+            "name": source_name,
+            "path": None  # 手動入力なのでパスはなし
+        })
+    
+    def build_index(self):
+        """
+        すべてのソースを統合して、検索可能なインデックスを構築するメソッド
+        
+        このメソッドは、すべてのソースを追加した後に1回だけ呼び出します。
+        既存のPDFRagSystemと同じように、BM25とChroma DBを構築します。
+        """
+        if not self.docs:
+            raise ValueError("チャンクが存在しません。先にソースを追加してください。")
+        
+        # Chroma DBの初期化（古いDBが残っていたら削除して新規作成）
+        if os.path.exists(self.persist_dir):
+            os.system(f"rm -rf {self.persist_dir}")
+        
+        # BM25検索器を構築（キーワード検索用）
+        # すべてのチャンクを統合して1つのBM25インデックスを作成
+        self.bm25 = BM25Retriever.from_documents(self.docs)
+        self.bm25.k = 60  # 候補取得数
+        
+        # ベクトルDB（Semantic検索用）を生成
+        # すべてのチャンクを統合して1つのベクトルDBを作成
+        self.vectorstore = Chroma.from_documents(
+            self.docs, self.embeddings, persist_directory=self.persist_dir
+        )
+    
+    def get_source_info(self) -> List[dict]:
+        """
+        読み込んだソースの情報を取得するメソッド
+        
+        Returns:
+            ソース情報のリスト
+        """
+        return self.sources.copy()
+    
+    def remove_source(self, source_index: int):
+        """
+        ソースを削除するメソッド（新機能）
+        
+        指定されたインデックスのソースと、そのソースから生成されたチャンクを削除します。
+        削除後は、build_index()を再度呼び出す必要があります。
+        
+        Args:
+            source_index: 削除するソースのインデックス（0から始まる）
+        
+        Raises:
+            IndexError: 指定されたインデックスが範囲外の場合
+        """
+        if source_index < 0 or source_index >= len(self.sources):
+            raise IndexError(f"ソースインデックス {source_index} が範囲外です。")
+        
+        # 削除するソースの情報を取得
+        source_to_remove = self.sources[source_index]
+        source_type = source_to_remove["type"]
+        source_name = source_to_remove["name"]
+        
+        # 該当するソースのチャンクを削除
+        # metadataのsource_typeとsource_nameが一致するチャンクを削除
+        self.docs = [
+            doc for doc in self.docs
+            if not (doc.metadata.get('source_type') == source_type and 
+                   doc.metadata.get('source_name') == source_name)
+        ]
+        
+        # ソース情報からも削除
+        self.sources.pop(source_index)
+        
+        # BM25とvectorstoreをクリア（再構築が必要）
+        self.bm25 = None
+        self.vectorstore = None
+
+
+# =========================================
+# ⑤ 複数ソース対応ReRankingRAG（拡張版）
+# =========================================
+class MultiSourceReRankingRAG:
+    """
+    複数ソース対応のリランキング付きRAGシステム
+    
+    既存のReRankingRAGの設計思想を維持しつつ、
+    MultiSourceRagSystemで構築したインデックスを使用するように拡張したクラス。
+    
+    主な機能：
+    - MultiSourceRagSystemで構築したインデックスを使用
+    - 検索結果にソース情報（source_type, source_name）を含める
+    - 既存のReRankingRAGと同じ検索・リランキング・回答生成の流れ
+    """
+    
+    def __init__(self, multi_source_system: MultiSourceRagSystem):
+        """
+        初期化メソッド
+        
+        Args:
+            multi_source_system: MultiSourceRagSystemのインスタンス
+                                （build_index()が呼ばれた後の状態）
+        """
+        # MultiSourceRagSystemの参照を保持
+        self.multi_source_system = multi_source_system
+        
+        # 検索対象チャンクを保持
+        self.docs = multi_source_system.docs
+        self.persist_dir = multi_source_system.persist_dir
+        
+        # embeddingモデル（Semantic検索用、384次元で統一）
+        self.embeddings = multi_source_system.embeddings
+        
+        # LLMモデル（Ollama llama3）
+        self.llm = Ollama(model="llama3:latest", temperature=0.0)
+        
+        # MultiSourceRagSystemで構築済みのvectorstoreを使用
+        self.vectorstore = multi_source_system.vectorstore
+        self.semantic = self.vectorstore.as_retriever(search_kwargs={"k": 60})
+        
+        # MultiSourceRagSystemで構築済みのBM25を使用
+        self.bm25 = multi_source_system.bm25
+        
+        # CrossEncoderリランカー
+        self.reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+        
+        # プロンプトテンプレート（後で設定可能）
+        self.prompt_template = None
+    
+    def clean_text(self, text: str) -> str:
+        """テキストのノイズを除去する関数"""
+        return re.sub(r"\n{3,}", "\n\n", text).strip()
+    
+    def search(self, question: str, k: int, w_sem: float, w_key: float, candidate_k: int = 60) -> List[Document]:
+        """
+        ハイブリッド検索 + リランキングを実行する（既存のReRankingRAGと同じ）
+        
+        検索結果には、各チャンクのmetadataにsource_typeとsource_nameが含まれます。
+        これにより、どのソースから来たチャンクかが分かります。
+        
+        Args:
+            question: 検索クエリ（質問文）
+            k: 返す文書の数
+            w_sem: Semantic検索の重み（0.0〜1.0）
+            w_key: BM25検索の重み（0.0〜1.0）
+            candidate_k: リランキング前の候補数
+        
+        Returns:
+            リランキング後の上位k件の文書リスト（各文書にsource_typeとsource_nameが含まれる）
+        """
+        # Semantic + Keyword のハイブリッド検索
+        ensemble = EnsembleRetriever(
+            retrievers=[self.semantic, self.bm25],
+            weights=[w_sem, w_key]
+        )
+        candidates = ensemble.get_relevant_documents(question)
+        
+        # CrossEncoderでスコア計算し並び替え
+        pairs: List[Tuple[str, str]] = [(question, d.page_content) for d in candidates]
+        scores = self.reranker.predict(pairs)
+        ranked = sorted(zip(candidates, scores), key=lambda x: x[1], reverse=True)
+        
+        # 上位k件を返す（各Documentにはsource_typeとsource_nameが含まれる）
+        return [doc for doc, _score in ranked[:k]]
+    
+    def answer(self, question: str, k: int, w_sem: float, w_key: float, candidate_k: int = 60) -> str:
+        """
+        質問に対する回答を生成する（既存のReRankingRAGと同じ）
+        
+        Args:
+            question: 質問文
+            k: 検索結果から使用する文書数
+            w_sem: Semantic検索の重み
+            w_key: BM25検索の重み
+            candidate_k: リランキング前の候補数
+        
+        Returns:
+            LLMが生成した回答（文字列）
+        """
+        if self.prompt_template is None:
+            raise ValueError("プロンプトテンプレートが設定されていません。")
+        
+        # 検索 → 上位k件の文脈をLLMへ
+        top_docs = self.search(question, k, w_sem, w_key, candidate_k)
+        context = "\n\n".join(d.page_content for d in top_docs)
+        
+        # PromptTemplateを使ってプロンプトを生成
+        prompt = self.prompt_template.format(context=context, question=question)
+        
+        # LLMにプロンプトを渡して回答を生成
+        raw_answer = self.llm.invoke(prompt)
+        
+        return raw_answer.strip()
