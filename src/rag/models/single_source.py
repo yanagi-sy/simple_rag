@@ -62,20 +62,18 @@ class ReRankingRAG:
         self.reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
         
         # プロンプトテンプレートの初期化（デフォルト値、後で上書き可能）
-        template = """あなたは日本語の質問応答システムです。以下の文脈から質問に答えてください。
-【文脈】
+        template = """【参考情報】
 {context}
 
 【質問】
 {question}
 
-【回答の際の注意点】
-・文脈に書かれている事実のみを使用する
-・推測や一般知識を混ぜない
-・答えられない場合は正直にその旨を伝える
-・丁寧で分かりやすい日本語で回答する
-
-【回答】"""
+【指示】
+- 必ず日本語で回答する
+- 文脈に書かれている事実のみを使用する
+- 推測や一般知識を混ぜない
+- 答えられない場合は正直にその旨を伝える
+- 余計な説明はせず「結論：〜」の1行だけ出力してください"""
         
         self.prompt_template = PromptTemplate(
             template=template,
@@ -120,12 +118,12 @@ class ReRankingRAG:
 
     def answer(self, question: str, k: int, w_sem: float, w_key: float, candidate_k: int = 60) -> str:
         """
-        質問に対する回答を生成する
+        質問に対する回答を生成する（LLMの回答から「結論：〜」の1行のみ抽出）
         
         処理の流れ：
         1. search()で関連文書を検索
         2. 検索結果を文脈としてLLMに渡す
-        3. LLMが生成した回答を返す
+        3. LLMが生成した回答から「結論：〜」の行だけ抽出
         
         Args:
             question: 質問文
@@ -135,7 +133,7 @@ class ReRankingRAG:
             candidate_k: リランキング前の候補数
         
         Returns:
-            LLMが生成した回答（文字列）
+            「結論：〜」の形式の1行のみ（日本語）
         """
         # プロンプトテンプレートが設定されていない場合はエラー
         if self.prompt_template is None:
@@ -157,8 +155,13 @@ class ReRankingRAG:
         # LLMに質問して回答を生成
         raw_answer = self.llm.invoke(prompt)
 
-        # 回答をクリーニングして返す
-        return raw_answer.strip()
+        # 結論1行だけ抽出
+        for line in raw_answer.split("\n"):
+            if line.strip().startswith("結論"):
+                return line.strip()
+        
+        # 保険：1行抽出できなければ先頭1行だけ返す
+        return raw_answer.split("\n")[0].strip()
 
     def generate_conclusion(self, question: str, k: int, w_sem: float, w_key: float, candidate_k: int = 60) -> str:
         """
