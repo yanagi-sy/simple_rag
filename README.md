@@ -67,7 +67,7 @@ ollama pull llama3:latest
 
 ```bash
 # プロジェクトディレクトリに移動
-cd /Users/yutakoyanagi/simple_rag.py
+cd ~/simple_rag.py
 
 # 実行スクリプトを使用（推奨）
 ./scripts/run_ui.sh
